@@ -298,6 +298,18 @@ createApp({
       }
     }
 
+    async function upgradeGeneration(cageId) {
+      clearFlash();
+      try {
+        const row = await api.upgradeGeneration(cageId);
+        flashOk(`已同笼升代：当前为代${row.generation}（零额变动，须按新代重新核验）`);
+        await refresh();
+        await selectCage(row);
+      } catch (e) {
+        flashErr(e);
+      }
+    }
+
     async function doAttest() {
       clearFlash();
       try {
@@ -439,6 +451,7 @@ createApp({
       loadBondDetail,
       freezeCage,
       selectCage,
+      upgradeGeneration,
       doAttest,
       doRelease,
       doForfeit,

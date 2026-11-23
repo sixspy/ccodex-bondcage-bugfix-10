@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from locks import cage_write_tx
 from models import AttestIn
 
 router = APIRouter(tags=["attest"])
@@ -33,8 +33,7 @@ def create_attestation(body: AttestIn, authorization: AuthHeader = None):
         raise HTTPException(400, "outcome 须为通过或违约")
     lock_key = f"cage:{body.cage_id}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
-        try:
+        with cage_write_tx(conn, lock_key, user):
             cage = conn.execute(
                 "SELECT * FROM cages WHERE id=?", (body.cage_id,)
             ).fetchone()
@@ -44,16 +43,19 @@ def create_attestation(body: AttestIn, authorization: AuthHeader = None):
                 raise HTTPException(409, "仅已冻结笼可核验")
             if float(cage["available"]) <= 0:
                 raise HTTPException(409, "笼可用额为 0，禁止核验")
-            # 同一笼代只允许一条有效核验结论
+            # 甲路径 · 代际隔离段：当前代令牌只取库内 cages.generation，
+            # 核验落库的 attest_gen 必须等于当前代；客户端无法把结论挂到任何别的代。
+            current_gen = int(cage["generation"])
+            # 同一笼代只允许一条有效核验结论（按当前代过滤，旧代结论不阻碍新代重核）
             prior = conn.execute(
                 """SELECT id FROM attestations
                    WHERE cage_id=? AND attest_gen=? AND outcome IN ('通过','违约')""",
-                (body.cage_id, int(cage["generation"])),
+                (body.cage_id, current_gen),
             ).fetchone()
             if prior:
                 raise HTTPException(409, "本笼代已有核验结论，禁止改口")
             now = now_iso()
-            gen = int(cage["generation"])
+            gen = current_gen
             cur = conn.execute(
                 """INSERT INTO attestations(cage_id,outcome,evidence,attest_gen,officer,created_at)
                    VALUES (?,?,?,?,?,?)""",
@@ -83,11 +85,7 @@ def create_attestation(body: AttestIn, authorization: AuthHeader = None):
                     "evidence": body.evidence or "",
                 },
             )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM attestations WHERE id=?", (cur.lastrowid,)
-            ).fetchone()
-            return dict(row)
-        finally:
-            release(conn, lock_key, user)
-            conn.commit()
+        row = conn.execute(
+            "SELECT * FROM attestations WHERE id=?", (cur.lastrowid,)
+        ).fetchone()
+        return dict(row)

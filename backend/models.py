@@ -24,6 +24,13 @@ class CageFreezeIn(BaseModel):
     cage_code: str | None = None
 
 
+class GenerationUpgradeIn(BaseModel):
+    """同笼升代：仅携带笼标识；当前代令牌一律以库内 cages.generation 为准，
+    绝不采信客户端传入的代际，从根上杜绝跨代键混入。"""
+
+    cage_id: int
+
+
 class AttestIn(BaseModel):
     cage_id: int
     outcome: str

@@ -361,3 +361,17 @@ th {
   margin-bottom: 12px;
   font-size: 13px;
 }
+
+/* 代际隔离（甲路径）：提示条与旧代只读列 */
+.gen-guard {
+  border: 1px solid var(--steel);
+  background: #eef2f6;
+  padding: 8px 10px;
+  border-radius: 4px;
+  color: var(--steel);
+}
+td.gen-old {
+  color: var(--steel-soft);
+  font-style: italic;
+  opacity: 0.85;
+}

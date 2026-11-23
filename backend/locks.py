@@ -1,5 +1,14 @@
-"""笼锁与争用登记（公共并发面）。"""
+"""笼锁与争用登记（公共并发面）。
+
+并发段口径：同笼一切写口（入笼/核验/解笼/罚没/升代/增补/拆笼）都抢同一把
+lock_key=f"cage:{cage_id}"（账户级写口抢 bond:{party_key}）。后到柜员争用：
+只登记 contention_log 可查，绝不插队落库；双会话真实对撞下若 SQLite 在插入
+持锁行时直接抛唯一约束/库锁冲突，同样按「争用」处置而非 500。
+"""
 from __future__ import annotations
+
+import sqlite3
+from contextlib import contextmanager
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -21,19 +30,65 @@ def try_acquire(conn, lock_key: str, holder: str) -> bool:
         "SELECT holder FROM cage_locks WHERE lock_key=?", (lock_key,)
     ).fetchone()
     if row is None:
-        conn.execute(
-            "INSERT INTO cage_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
-            (lock_key, holder, now),
-        )
-        return True
-    if row["holder"] == holder:
+        # 双会话同时走到这里：唯一约束会拦下后到者，按争用处理而非冒泡 500。
+        try:
+            conn.execute(
+                "INSERT INTO cage_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
+                (lock_key, holder, now),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            row = conn.execute(
+                "SELECT holder FROM cage_locks WHERE lock_key=?", (lock_key,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:  # database is locked 等库级争用
+            conn.rollback()
+            conn.execute(
+                """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
+                   VALUES (?,?,?,?,?)""",
+                (lock_key, holder, "争用", f"库级锁冲突:{exc}", now),
+            )
+            return False
+    if row is not None and row["holder"] == holder:
         return True
     conn.execute(
         """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
            VALUES (?,?,?,?,?)""",
-        (lock_key, holder, "争用", f"持有者={row['holder']}", now),
+        (lock_key, holder, "争用", f"持有者={row['holder'] if row else '未知'}", now),
     )
     return False
+
+
+@contextmanager
+def cage_write_tx(conn, lock_key: str, holder: str):
+    """同笼写口统一事务边界（并发段）。
+
+    1. 先获锁：若争用，contention_log 立即提交留痕后抛 409（不被业务回滚带走）；
+    2. 获锁成功后开 SAVEPOINT 跑业务：业务异常只回滚到保存点（零增零改），
+       锁册动作与争用留痕独立于业务事务，绝不丢失；
+    3. 退出时释放本持有者的笼锁。
+    """
+    try:
+        require_lock(conn, lock_key, holder)
+    except HTTPException:
+        conn.commit()  # 争用留痕落库可查，随后整笔拒收
+        raise
+    acquired = True
+    try:
+        conn.execute("SAVEPOINT cage_write")
+        yield
+        conn.execute("RELEASE SAVEPOINT cage_write")
+        conn.commit()
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT cage_write")
+        conn.execute("RELEASE SAVEPOINT cage_write")
+        conn.commit()  # 业务写整笔回滚（零改零增）
+        raise
+    finally:
+        if acquired:
+            release(conn, lock_key, holder)
+            conn.commit()
 
 
 def release(conn, lock_key: str, holder: str) -> None:

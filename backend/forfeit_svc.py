@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from locks import cage_write_tx
 from models import ForfeitIn
 
 router = APIRouter(tags=["forfeit"])
@@ -29,8 +29,7 @@ def do_forfeit(body: ForfeitIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
     lock_key = f"cage:{body.cage_id}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
-        try:
+        with cage_write_tx(conn, lock_key, user):
             cage = conn.execute(
                 "SELECT * FROM cages WHERE id=?", (body.cage_id,)
             ).fetchone()
@@ -38,6 +37,8 @@ def do_forfeit(body: ForfeitIn, authorization: AuthHeader = None):
                 raise HTTPException(404, "笼不存在")
             if cage["status"] != "核验违约":
                 raise HTTPException(409, "仅核验违约的笼可罚没")
+            # 甲路径 · 代际隔离段：违约核验必须对齐当前笼代（attest_gen=当前代），
+            # 旧代违约结论不得作为新代罚没凭证。
             att = conn.execute(
                 """SELECT * FROM attestations
                    WHERE cage_id=? AND attest_gen=? AND outcome='违约'
@@ -102,11 +103,7 @@ def do_forfeit(body: ForfeitIn, authorization: AuthHeader = None):
                     "forfeit_ref": ref,
                 },
             )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM forfeits WHERE id=?", (cur.lastrowid,)
-            ).fetchone()
-            return dict(row)
-        finally:
-            release(conn, lock_key, user)
-            conn.commit()
+        row = conn.execute(
+            "SELECT * FROM forfeits WHERE id=?", (cur.lastrowid,)
+        ).fetchone()
+        return dict(row)

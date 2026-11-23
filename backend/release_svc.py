@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from locks import cage_write_tx
 from models import ReleaseIn
 
 router = APIRouter(tags=["release"])
@@ -29,8 +29,8 @@ def do_release(body: ReleaseIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
     lock_key = f"cage:{body.cage_id}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
-        try:
+        # 并发段：与升代/核验/罚没共用同一把 cage:{id} 笼锁；争用即留痕并 409。
+        with cage_write_tx(conn, lock_key, user):
             cage = conn.execute(
                 "SELECT * FROM cages WHERE id=?", (body.cage_id,)
             ).fetchone()
@@ -38,16 +38,18 @@ def do_release(body: ReleaseIn, authorization: AuthHeader = None):
                 raise HTTPException(404, "笼不存在")
             if cage["status"] != "核验通过":
                 raise HTTPException(409, "仅核验通过的笼可解笼拨付")
-            # 核验结论必须对齐当前笼代
-            # BUGFIX-10 埋雷：解笼可引用任意代核验
+            # 甲路径 · 代际隔离段：核验结论必须对齐「当前笼代」。
+            # 当前代令牌只取库内 cages.generation；旧代（跨代键）核验一律不得
+            # 作为新代解笼凭证，遇旧代引用正式零改拒写（状态门 + 代际门双保险）。
+            current_gen = int(cage["generation"])
             att = conn.execute(
                 """SELECT * FROM attestations
-                   WHERE cage_id=? AND outcome='通过'
+                   WHERE cage_id=? AND attest_gen=? AND outcome='通过'
                    ORDER BY id DESC LIMIT 1""",
-                (body.cage_id,),
+                (body.cage_id, current_gen),
             ).fetchone()
             if not att:
-                raise HTTPException(409, "缺少与笼代对齐的通过核验")
+                raise HTTPException(409, "缺少与当前笼代对齐的通过核验，禁止挂旧代凭证解笼")
             avail = float(cage["available"])
             amount = float(body.amount) if body.amount is not None else avail
             if amount <= 0:
@@ -56,7 +58,7 @@ def do_release(body: ReleaseIn, authorization: AuthHeader = None):
                 raise HTTPException(409, "拨付金额超过笼可用额")
             payee = body.payee or cage["beneficiary"]
             now = now_iso()
-            gen = int(cage["generation"])
+            gen = current_gen
             ref = f"REL-{cage['cage_code']}-g{gen}-{int(now.replace(':', '').replace('-', '').replace('T', '')[-8:])}"
             cur = conn.execute(
                 """INSERT INTO releases(cage_id,amount,payee,cage_generation,status,release_ref,created_at)
@@ -89,11 +91,7 @@ def do_release(body: ReleaseIn, authorization: AuthHeader = None):
                     "release_ref": ref,
                 },
             )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM releases WHERE id=?", (cur.lastrowid,)
-            ).fetchone()
-            return dict(row)
-        finally:
-            release(conn, lock_key, user)
-            conn.commit()
+        row = conn.execute(
+            "SELECT * FROM releases WHERE id=?", (cur.lastrowid,)
+        ).fetchone()
+        return dict(row)

@@ -5,10 +5,19 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
-from models import CageFreezeIn
+from locks import cage_write_tx, release, require_lock
+from models import CageFreezeIn, GenerationUpgradeIn
 
 router = APIRouter(tags=["cages"])
+
+# 升代允许的活态；终态（已解笼/已罚没）与零可用笼不得升代
+UPGRADABLE_STATUS = (
+    "已冻结",
+    "核验通过",
+    "核验违约",
+    "部分解笼",
+    "部分罚没",
+)
 
 
 def _next_cage_code(conn, party_key: str) -> str:
@@ -126,3 +135,53 @@ def freeze_cage(body: CageFreezeIn, authorization: AuthHeader = None):
         finally:
             release(conn, lock_key, user)
             conn.commit()
+
+
+@router.post("/api/cages/generation/upgrade")
+def upgrade_generation(body: GenerationUpgradeIn, authorization: AuthHeader = None):
+    """同笼升代写口（甲路径 · 代际隔离段）。
+
+    - 当前代令牌只取库内 cages.generation，目标代 = 当前代 + 1，客户端无法指定/伪造；
+    - 只翻代际与状态，零额变动：cages.amount/available 与 bond_accounts 一律不动；
+    - 升代后笼回到「已冻结」，强制新代重新核验，旧代核验/拨付/罚没仅作只读历史；
+    - 并发段：与解笼/核验/罚没共用同一把 cage:{id} 笼锁，后到争用 409 不插队落库。
+    """
+    user = require_writer(authorization)
+    lock_key = f"cage:{body.cage_id}"
+    with connect() as conn:
+        # 并发段：与解笼/核验/罚没共用同一把 cage:{id} 笼锁；争用即留痕并 409。
+        with cage_write_tx(conn, lock_key, user):
+            cage = conn.execute(
+                "SELECT * FROM cages WHERE id=?", (body.cage_id,)
+            ).fetchone()
+            if not cage:
+                raise HTTPException(404, "笼不存在")
+            if cage["status"] not in UPGRADABLE_STATUS:
+                raise HTTPException(409, f"笼状态 {cage['status']} 禁止升代")
+            if float(cage["available"]) <= 0:
+                raise HTTPException(409, "笼可用额为 0，禁止空笼升代")
+            old_gen = int(cage["generation"])
+            new_gen = old_gen + 1
+            # 零额变动：只翻代际、状态回待核验；金额/可用/账户全部不碰
+            conn.execute(
+                "UPDATE cages SET generation=?, status='已冻结' WHERE id=?",
+                (new_gen, body.cage_id),
+            )
+            write_audit(
+                conn,
+                user,
+                "generation_upgrade",
+                cage["cage_code"],
+                {
+                    "cage_id": body.cage_id,
+                    "from_generation": old_gen,
+                    "to_generation": new_gen,
+                    "amount_unchanged": float(cage["amount"]),
+                    "available_unchanged": float(cage["available"]),
+                    "note": "same_cage_generation_upgrade_zero_balance_change",
+                },
+            )
+        row = conn.execute(
+            "SELECT * FROM cages WHERE id=?", (body.cage_id,)
+        ).fetchone()
+        return dict(row)
